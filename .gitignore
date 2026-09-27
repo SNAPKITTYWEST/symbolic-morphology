@@ -1,0 +1,32 @@
+# Build artifacts
+target/
+bin/
+obj/
+*.dll
+*.exe
+*.pdb
+
+# Rust
+src/rust/target/
+
+# .NET
+src/csharp/bin/
+src/csharp/obj/
+src/fsharp/bin/
+src/fsharp/obj/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vs/
+.vscode/
+*.suo
+*.user
+
+# OS
+Thumbs.db
+.DS_Store
