@@ -1,0 +1,55 @@
+#!/usr/bin/env dyalogscript
+⍝ Symbolic morphology learner — Dyalog APL port. Same architecture, init and online SGD as src/rust.
+⍝ embed(16) → mean-pool → tanh(32) → sigmoid(23), BCE, manual backprop, lr 0.5, 3001 epochs.
+⍝ Run from this directory:  dyalogscript morphology.apls
+⎕IO←0 ⋄ ⎕ML←1 ⋄ ⎕PP←17
+E H F LR←16 32 23 0.5
+
+⍝ ── data ─────────────────────────────────────────────────────────────────────
+nums←{1⊃⎕VFI 'e' ⎕R 'E' ⊢ '-' ⎕R '¯' ⊢ ∊⍵,¨' '}
+v←nums ⊃⎕NGET '../bench/shared/init.txt' 1
+emb←(128 E)⍴v ⋄ v↓⍨←128×E
+w1←(H E)⍴v ⋄ v↓⍨←H×E
+b1←H↑v ⋄ v↓⍨←H
+w2←(F H)⍴v ⋄ v↓⍨←F×H
+b2←F↑v
+lines←⊃⎕NGET '../bench/shared/corpus.txt' 1
+words←{⎕UCS ⍵↑⍨⍵⍳' '}¨lines       ⍝ character codes of each word
+tgt←{nums (1+⍵⍳' ')↓⍵}¨lines         ⍝ 23 flags per word
+tgt←↑tgt
+n←≢words
+
+⍝ ── one online-SGD step; returns the BCE loss of the sample (before the update) ─
+∇ l←Step (w t);len;h;a1;y;dz2;dz1;dh;c;p
+  len←≢w
+  h←(+⌿emb[w;])÷len
+  a1←7○b1+w1+.×h
+  y←÷1+*-b2+w2+.×a1
+  p←1E¯12⌈y⌊1-1E¯12
+  l←(+/-(t×⍟p)+(1-t)×⍟1-p)÷F
+  dz2←(y-t)÷F
+  dz1←(dz2+.×w2)×1-a1*2
+  dh←dz1+.×w1
+  :For c :In w
+      emb[c;]-←LR×dh÷len
+  :EndFor
+  b1-←LR×dz1
+  w1-←LR×dz1∘.×h
+  b2-←LR×dz2
+  w2-←LR×dz2∘.×a1
+∇
+
+∇ last←Train epochs;e;s;tot
+  :For e :In ⍳epochs+1
+      tot←0
+      :For s :In ⍳n
+          tot+←Step (s⊃words)(s⌷tgt)
+      :EndFor
+      last←tot÷n
+  :EndFor
+∇
+
+t0←⎕AI[2]
+last←Train 3000
+dt←(⎕AI[2]-t0)÷1000
+⎕←'apl   examples=',(⍕n),' epochs=3001 final_loss=',(⍕last),' time=',(⍕dt),'s ex/s=',⍕(n×3001)÷dt

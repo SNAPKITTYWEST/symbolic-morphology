@@ -9,7 +9,7 @@
 [![C# .NET 8](https://img.shields.io/badge/C%23-.NET%208-512BD4?logo=dotnet)](./src/csharp)
 [![F# .NET 8](https://img.shields.io/badge/F%23-.NET%208-378BBA?logo=.net)](./src/fsharp)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python)](./src/python)
-[![Benchmarks](https://img.shields.io/badge/Benchmarks-6%20runtimes-green)](#benchmarks)
+[![Benchmarks](https://img.shields.io/badge/Benchmarks-9%20runtimes-green)](#benchmarks)
 [![No ML Framework](https://img.shields.io/badge/ML%20Framework-None-red)](#mathematical-core)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero-lightgrey)](#building)
 
@@ -319,6 +319,29 @@ xychart-beta
     y-axis "examples/sec" 0 --> 210000
     bar [198881, 127879, 104466, 1516, 37]
 ```
+
+### Cross-language run (identical data and initial weights)
+
+The table above was measured on a different machine and architecture per runtime. To compare languages directly, `bench/run.sh` trains Rust, Mojo, BQN, Dyalog APL and Forth from the **same** `bench/shared/corpus.txt` and seed-42 `bench/shared/init.txt`: online SGD, lr 0.5, 3,001 epochs, embed 16 → tanh 32 → sigmoid 23. All of them finish at the same loss (9.1009e-5). Best of 3, single thread, x86-64 Linux.
+
+| Rank | Runtime | Time | Throughput |
+|---|---|---|---|
+| 1 | **Rust, allocation-free** (`src/rust/src/bin/lean.rs`) | **0.62 s** | **463,000 ex/s** |
+| 2 | Mojo 1.1.0 `-O3` (`mojo/morphology.mojo`) | 0.91 s | 315,000 ex/s |
+| 3 | Rust, original engine | 2.58 s | 112,000 ex/s |
+| 4 | BQN, CBQN (`bqn/morphology.bqn`) | 2.77 s | 104,000 ex/s |
+| 5 | Dyalog APL 20.0 (`dyalog-apl/morphology.apls`) | 5.91 s | 48,800 ex/s |
+| 6 | Forth, gforth 0.7.3 (`forth/morphology.fs`) | 24.9 s | 11,600 ex/s |
+
+```mermaid
+xychart-beta
+    title "Cross-language training throughput (examples/second)"
+    x-axis ["Rust lean", "Mojo", "Rust orig", "BQN", "APL", "Forth"]
+    y-axis "examples/sec" 0 --> 500000
+    bar [463000, 315000, 112000, 104000, 48800, 11600]
+```
+
+Mojo beats the original Rust engine because that engine allocates in every forward and backward call; the allocation-free Rust port is the fair native baseline. The array languages pay per-primitive overhead on 16–32-wide vectors. Details in [`bench/results.md`](./bench/results.md).
 
 ### Quality
 
