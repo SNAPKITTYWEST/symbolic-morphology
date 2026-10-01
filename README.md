@@ -471,13 +471,6 @@ Median of 3 runs, 4-vCPU host. Single head, `D = 64`, `n = 2048`, causal.
 | attention | scalar | 2.15 s | 134,000 | 8.3181e-5 |
 | attention | AVX2+FMA | 1.40 s | 205,000 | 8.3181e-5 |
 
-### Language support
-
-| Language | Kernel | Training loop |
-|---|---|---|
-| Rust | ✓ | ✓ |
-| Python | ✓ | — |
-
 ---
 
 ## The Three Layers
