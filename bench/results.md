@@ -30,3 +30,19 @@ Best of 3, single thread, 4-core x86-64 Linux container.
 Notes: the original Rust engine allocates `Vec`s in every forward and backward call; the lean port removes that
 and is the fair native baseline. Dyalog and gforth are interpreters; APL's cost is per-primitive overhead on
 tiny arrays (16–32 wide), where the vector primitives don't get room to pay off.
+
+## Attention kernel (Rust, `src/rust/src/bin/attention.rs`, 2026-10-01)
+
+Built on the top-ranked runtime (allocation-free Rust). `cd src/rust && cargo run --release --bin attention`.
+Single head, f64, single thread, best of 3; fused = one-pass online softmax over 16-key blocks (no score matrix).
+Both kernels agree to ≤ 2.2e-16 on every config and on the real seed-42 letter embeddings.
+
+| Config | Reference | Fused | Speedup |
+|---|---|---|---|
+| n=8, d=16 (word-sized) | 2.1 GF/s | 3.9 GF/s | 1.86× |
+| n=128, d=64, bidirectional | 2.1 GF/s | 3.9 GF/s | 1.81× |
+| n=128, d=64, causal | 1.9 GF/s | 4.3 GF/s | 2.20× |
+| n=512, d=64, bidirectional | 2.0 GF/s | 3.4 GF/s | 1.66× |
+| n=512, d=64, causal | 1.9 GF/s | 3.9 GF/s | 2.11× |
+
+Forward pass only; no backward kernel yet, so it is not wired into the lean.rs training loop.
