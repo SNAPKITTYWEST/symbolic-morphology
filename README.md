@@ -404,17 +404,6 @@ Lᵢ  = log Σⱼ exp(Sᵢⱼ)  (saved)      dS = P ⊙ (dP − Δ)
 | AVX2+FMA | same | same | explicit intrinsics, runtime-detected |
 | Threaded | row partition | row partition | bit-identical for any thread count |
 
-### Configuration errors
-
-| Condition | Result |
-|---|---|
-| Shape mismatch | `AttnError::Shape` |
-| NaN or infinite input | `AttnError::NonFinite` |
-| `D = 0` | `AttnError::Shape` |
-| `threads = 0` / `threads > 256` | `AttnError::ZeroThreads` / `TooManyThreads` |
-| AVX2 with `D % 4 ≠ 0` | `AttnError::DimNotMultipleOf4` |
-| AVX2 on a CPU without AVX2+FMA | `AttnError::UnsupportedIsa` |
-
 ### `lean.rs` integration
 
 ```
