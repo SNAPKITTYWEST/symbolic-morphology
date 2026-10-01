@@ -31,18 +31,21 @@ Notes: the original Rust engine allocates `Vec`s in every forward and backward c
 and is the fair native baseline. Dyalog and gforth are interpreters; APL's cost is per-primitive overhead on
 tiny arrays (16–32 wide), where the vector primitives don't get room to pay off.
 
-## Attention kernel (Rust, `src/rust/src/bin/attention.rs`, 2026-10-01)
+## Attention kernel (Rust, `src/rust/src/attention.rs`, 2026-10-01)
 
-Built on the top-ranked runtime (allocation-free Rust). `cd src/rust && cargo run --release --bin attention`.
-Single head, f64, single thread, best of 3; fused = one-pass online softmax over 16-key blocks (no score matrix).
-Both kernels agree to ≤ 2.2e-16 on every config and on the real seed-42 letter embeddings.
+Forward + backward attention kernel with scalar, AVX2+FMA and threaded paths, integrated into `lean.rs` (`pool=attn`, default; `pool=mean` is the model in the
+table above). Full method, tables, tolerances and the compute-vs-memory analysis: [`docs/ATTENTION.md`](../docs/ATTENTION.md).
+Reproduce: `cd src/rust && cargo test --release && cargo run --release --bin attention`.
 
-| Config | Reference | Fused | Speedup |
-|---|---|---|---|
-| n=8, d=16 (word-sized) | 2.1 GF/s | 3.9 GF/s | 1.86× |
-| n=128, d=64, bidirectional | 2.1 GF/s | 3.9 GF/s | 1.81× |
-| n=128, d=64, causal | 1.9 GF/s | 4.3 GF/s | 2.20× |
-| n=512, d=64, bidirectional | 2.0 GF/s | 3.4 GF/s | 1.66× |
-| n=512, d=64, causal | 1.9 GF/s | 3.9 GF/s | 2.11× |
+Headline (single head, D=64, n=2048 causal, median of 3 runs, shared 4-vCPU host — ±10–40 % run-to-run noise):
 
-Forward pass only; no backward kernel yet, so it is not wired into the lean.rs training loop.
+| Implementation | Forward | Backward |
+|---|---:|---:|
+| reference (materialised) | 270 ms · 2.0 GF/s | 3902 ms · 0.5 GF/s |
+| fused scalar (vectoriser off) | 132 ms · 4.1 GF/s | 559 ms · 3.4 GF/s |
+| fused scalar (LLVM autovec) | 112 ms · 4.8 GF/s | 426 ms · 4.4 GF/s |
+| fused AVX2+FMA, 1 thread | 58 ms · 9.3 GF/s | 153 ms · 12.3 GF/s |
+| fused AVX2+FMA, 4 threads | 21 ms · 25.8 GF/s | 61 ms · 30.9 GF/s |
+
+Compute-side, not memory-bound (intensity ≫ DRAM ridge; per-pair time flat from 64 KiB to 4 MiB). Threads hurt at word size (n ≤ 10) and do not help at n = 128. `lean` end to end:
+mean-pool 0.76 s (9.1009e-5), attention AVX2 1.40 s (8.3181e-5), attention scalar 2.15 s (8.3181e-5).
