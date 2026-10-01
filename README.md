@@ -25,6 +25,7 @@
 - [Repository Structure](#repository-structure)
 - [Building and Running](#building-and-running)
 - [Benchmarks](#benchmarks)
+- [Attention Kernel](#attention-kernel)
 - [The Three Layers](#the-three-layers)
 - [Training Corpus](#training-corpus)
 - [Boolean Convergence](#boolean-convergence)
@@ -362,6 +363,101 @@ Mojo beats the original Rust engine because that engine allocates in every forwa
 **Python float is architecturally superior** — it uses an Elman RNN that processes characters sequentially (crucial for suffix morphology) and trains on a richer corpus (198 words, 4 conjugations, passive voice, subjunctive). It pays ~140x for the interpreter.
 
 **The NAND variant** decomposes every arithmetic operation to bit-parallel NAND gates through a Kogge-Stone carry-lookahead adder, shift-add multiplier, and table-lookup transcendentals in Q(16.8) fixed-point. It achieves 90% bit-level accuracy on seen words and 83.8% on unseen words with only D=3, H=4, and 40 epochs — a remarkable result for a system where every multiply is a software bit-serial loop.
+
+---
+
+## Attention Kernel
+
+Scaled dot-product attention with a forward and a backward pass, written in Rust (`src/rust/src/attention.rs`), used by `lean.rs`, and ported to pure Python (`src/python/attention.py`). Full details, tolerances and tables: [`docs/ATTENTION.md`](./docs/ATTENTION.md).
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `src/rust/src/attention.rs` | Kernel: forward, backward, reference, AVX2+FMA, threading, unit tests |
+| `src/rust/src/lib.rs` | Library root exposing `attention` |
+| `src/rust/src/bin/attention.rs` | Benchmark; `--write-golden` regenerates the golden vectors |
+| `src/rust/src/bin/lean.rs` | Training loop with `pool=attn` / `pool=mean` (modified) |
+| `src/rust/tests/lean_cli.rs` | End-to-end tests through the `lean` binary |
+| `src/python/attention.py` | Pure-Python port and self-tests |
+| `bench/shared/attention_golden.txt` | Golden vectors read by the Rust tests and the Python port |
+| `docs/ATTENTION.md` | Full documentation |
+
+### Operation
+
+Single head, no learned projections. Tensors are row-major `f64` with `n` rows and `D` columns; `scale = 1/√D`; with `causal`, entries with `j > i` are masked.
+
+```
+Forward                              Backward (given dO)
+S   = scale · Q Kᵀ                   dV = Pᵀ dO
+P   = softmax_row(S)                 dP = dO Vᵀ
+O   = P V                            Δᵢ = Σⱼ Pᵢⱼ dPᵢⱼ = dOᵢ · Oᵢ
+Lᵢ  = log Σⱼ exp(Sᵢⱼ)  (saved)      dS = P ⊙ (dP − Δ)
+                                     dQ = scale · dS K
+                                     dK = scale · dSᵀ Q
+```
+
+The fused backward does not store `P`; it recomputes `Pᵢⱼ = exp(scale·qᵢ·kⱼ − Lᵢ)` from the saved `L`.
+
+### Implementations
+
+| Path | Description |
+|---|---|
+| Reference (`forward_reference`, `backward_reference`) | Materialises the n×n matrices. Used as the oracle in tests. |
+| Fused scalar | Online-softmax forward over 16-key blocks; two-pass backward (dQ by query row, dK/dV by key row). |
+| AVX2+FMA | Same algorithm with explicit AVX2+FMA intrinsics for the dot/axpy/scale primitives. Runtime-detected. |
+| Threaded | Static row partition. Results are bit-identical for any thread count. |
+
+Unsupported configurations return an error instead of falling back: shape mismatch, non-finite input, `D = 0`, `threads = 0` or above 256, AVX2 with `D % 4 ≠ 0`, AVX2 on a CPU without it.
+
+### Use in `lean.rs`
+
+```
+lean [dir] [pool=attn|mean] [epochs=3001] [isa=auto|scalar|avx2] [threads=1]
+```
+
+- `pool=mean` is the original mean-pool. `bench/run.sh` uses it so the cross-language comparison stays on the same model.
+- `pool=attn` (default) replaces mean-pooling with self-attention over the word's letter embeddings: `X` = the `n×16` embeddings, `O = softmax(X Xᵀ/√16) X` (Q = K = V = X, no new parameters), `h = (1/n) Σᵢ Oᵢ`. Everything after `h` is unchanged. In the backward pass `dOᵢ = dh/n`, and the gradient reaching letter position `i` is `dQᵢ + dKᵢ + dVᵢ`.
+
+### Build, test, benchmark
+
+```bash
+cd src/rust
+cargo test --release                      # kernel, lean.rs and CLI tests
+cargo run --release --bin attention       # correctness gate, then benchmark
+cargo run --release --bin lean -- ../../bench/shared attn
+python3 ../python/attention.py            # Python port self-tests + golden vectors
+```
+
+Tests cover fused vs reference (forward, backward), central finite differences, edge cases (`n = 0`, `n = 1`, constant `V`, causal masking, large logits), bit-identical results across thread counts, golden vectors shared with Python, finite-difference checks of the full `lean.rs` training-path gradients, and the mean-pool path being bit-identical to the original loop.
+
+### Results
+
+Median of 3 runs on a shared 4-vCPU host (run-to-run noise ±10–40%). Single head, `D = 64`, `n = 2048`, causal:
+
+| Implementation | Forward | Backward |
+|---|---:|---:|
+| Reference (materialised) | 2.0 GF/s | 0.5 GF/s |
+| Fused scalar, LLVM vectoriser off | 4.1 GF/s | 3.4 GF/s |
+| Fused scalar, LLVM autovec | 4.8 GF/s | 4.4 GF/s |
+| AVX2+FMA, 1 thread | 9.3 GF/s | 12.3 GF/s |
+| AVX2+FMA, 4 threads | 25.8 GF/s | 30.9 GF/s |
+
+`lean`, 96 words × 3001 epochs, best of 3:
+
+| Pooling | Kernel | Time | Final loss |
+|---|---|---:|---|
+| mean | — | 0.76 s | 9.1009e-5 |
+| attention | scalar | 2.15 s | 8.3181e-5 |
+| attention | AVX2+FMA | 1.40 s | 8.3181e-5 |
+
+The kernel is compute-side rather than memory-bound. Threads are slower than one thread at word size (`n ≤ 10`) and do not help at `n = 128`; use `threads=1` in `lean`.
+
+### Not implemented
+
+- Ports to BQN, Dyalog APL, Forth, Mojo, C# and F#. Only Rust and Python have the attention kernel.
+- The Python port has no SIMD or threading and is not used by the Python training scripts.
+- No AVX-512 or NEON path; no learned Q/K/V projections.
 
 ---
 
