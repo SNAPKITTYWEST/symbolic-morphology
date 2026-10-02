@@ -1,7 +1,15 @@
 # Symbolic morphology learner — Mojo port. Same architecture, init and online SGD as src/rust.
 # embed(16) -> mean-pool -> tanh(32) -> sigmoid(23), BCE, manual backprop, lr 0.5, 3001 epochs.
+#
+#   morphology [pool=mean|attn] [epochs=3001] [kernel=simd|scalar]
+#
+# pool=mean (default) is the original mean-pool. pool=attn replaces it with self-attention over the word's letter
+# embeddings (Q = K = V = X, bidirectional, no new parameters): O = softmax(X X^T / sqrt(16)) X, h = (1/n) sum_i O_i,
+# using the forward/backward kernel in attention.mojo; the gradient reaching letter position i is dQ_i + dK_i + dV_i.
 from std.time import perf_counter_ns
 from std.math import exp, tanh, log
+from std.sys import argv
+from attention import attn_forward, attn_backward
 
 comptime E = 16
 comptime H = 32
@@ -15,6 +23,22 @@ def sigmoid(x: Float64) -> Float64:
     return e / (1.0 + e)
 
 def main() raises:
+    var args = argv()
+    var use_attn = False
+    if len(args) > 1:
+        if args[1] == "attn":
+            use_attn = True
+        elif args[1] != "mean":
+            raise Error("morphology: unknown pool '" + String(args[1]) + "' (expected mean or attn)")
+    var total_epochs = 3001
+    if len(args) > 2:
+        total_epochs = atol(String(args[2]))
+    var use_simd = True
+    if len(args) > 3:
+        if args[3] == "scalar":
+            use_simd = False
+        elif args[3] != "simd":
+            raise Error("morphology: unknown kernel '" + String(args[3]) + "' (expected simd or scalar)")
     var shared = String("../bench/shared/")
     var init = open(shared + "init.txt", "r").read().split("\n")
     var k = 0
@@ -81,20 +105,53 @@ def main() raises:
     var pdh = dh.unsafe_ptr()
 
 
-    var epochs = 3000
+    # attention workspaces, one set per word length so the kernel's exact-length shape checks hold
+    var maxlen = 0
+    for s in range(n):
+        maxlen = max(maxlen, woff[s + 1] - woff[s])
+    var xs = List[List[Float64]]()
+    var os_ = List[List[Float64]]()
+    var lses = List[List[Float64]]()
+    var douts = List[List[Float64]]()
+    var dqs = List[List[Float64]]()
+    var dks = List[List[Float64]]()
+    var dvs = List[List[Float64]]()
+    var deltas = List[List[Float64]]()
+    if use_attn:
+        for ln_ in range(maxlen + 1):
+            xs.append(List[Float64](length=ln_ * E, fill=0.0))
+            os_.append(List[Float64](length=ln_ * E, fill=0.0))
+            lses.append(List[Float64](length=ln_, fill=0.0))
+            douts.append(List[Float64](length=ln_ * E, fill=0.0))
+            dqs.append(List[Float64](length=ln_ * E, fill=0.0))
+            dks.append(List[Float64](length=ln_ * E, fill=0.0))
+            dvs.append(List[Float64](length=ln_ * E, fill=0.0))
+            deltas.append(List[Float64](length=ln_, fill=0.0))
+
     var last = 0.0
     var t0 = perf_counter_ns()
-    for _ in range(epochs + 1):
+    for _ in range(total_epochs):
         var total = 0.0
         for s in range(n):
             var wo = woff[s]
             var len_ = woff[s + 1] - wo
             # forward
-            for d in range(E):
-                var sum = 0.0
+            if use_attn:
                 for t in range(len_):
-                    sum += pemb[pwc[wo + t] * E + d]
-                ppooled[d] = sum / Float64(len_)
+                    for d in range(E):
+                        xs[len_][t * E + d] = pemb[pwc[wo + t] * E + d]
+                attn_forward[E](use_simd, xs[len_], xs[len_], xs[len_], os_[len_], lses[len_], len_, False)
+                for d in range(E):
+                    var sum = 0.0
+                    for t in range(len_):
+                        sum += os_[len_][t * E + d]
+                    ppooled[d] = sum / Float64(len_)
+            else:
+                for d in range(E):
+                    var sum = 0.0
+                    for t in range(len_):
+                        sum += pemb[pwc[wo + t] * E + d]
+                    ppooled[d] = sum / Float64(len_)
             for i in range(H):
                 var z = pb1[i]
                 for j in range(E):
@@ -126,10 +183,21 @@ def main() raises:
                     sum += pw1[i * E + j] * pdz1[i]
                 pdh[j] = sum
             var inv_n = 1.0 / Float64(len_)
-            for t in range(len_):
-                var c = pwc[wo + t]
-                for d in range(E):
-                    pemb[c * E + d] -= LR * (inv_n * pdh[d])
+            if use_attn:
+                for t in range(len_):
+                    for d in range(E):
+                        douts[len_][t * E + d] = inv_n * pdh[d]
+                attn_backward[E](use_simd, xs[len_], xs[len_], xs[len_], os_[len_], lses[len_], douts[len_],
+                                 dqs[len_], dks[len_], dvs[len_], deltas[len_], len_, False)
+                for t in range(len_):
+                    var c = pwc[wo + t]
+                    for d in range(E):
+                        pemb[c * E + d] -= LR * (dqs[len_][t * E + d] + dks[len_][t * E + d] + dvs[len_][t * E + d])
+            else:
+                for t in range(len_):
+                    var c = pwc[wo + t]
+                    for d in range(E):
+                        pemb[c * E + d] -= LR * (inv_n * pdh[d])
             for i in range(H):
                 pb1[i] -= LR * pdz1[i]
                 for j in range(E):
@@ -140,4 +208,5 @@ def main() raises:
                     pw2[i * H + j] -= LR * (pdz2[i] * pa1[j])
         last = total / Float64(n)
     var dt = Float64(perf_counter_ns() - t0) / 1e9
-    print("mojo  examples=", n, " epochs=", epochs + 1, " final_loss=", last, " time=", dt, "s ex/s=", Float64(n * (epochs + 1)) / dt)
+    var label = String("mojo-attn") if use_attn else String("mojo")
+    print(label, " examples=", n, " epochs=", total_epochs, " final_loss=", last, " time=", dt, "s ex/s=", Float64(n * total_epochs) / dt)
