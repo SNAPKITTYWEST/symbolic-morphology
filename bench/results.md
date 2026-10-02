@@ -49,3 +49,23 @@ Headline (single head, D=64, n=2048 causal, median of 3 runs, shared 4-vCPU host
 
 Compute-side, not memory-bound (intensity ≫ DRAM ridge; per-pair time flat from 64 KiB to 4 MiB). Threads hurt at word size (n ≤ 10) and do not help at n = 128. `lean` end to end:
 mean-pool 0.76 s (9.1009e-5), attention AVX2 1.40 s (8.3181e-5), attention scalar 2.15 s (8.3181e-5).
+
+### Mojo and F# attention kernels (2026-10-02)
+
+Kernels in `mojo/attention.mojo` and `src/fsharp/Attention.fs`; method and checks in [`docs/ATTENTION.md`](../docs/ATTENTION.md). D=64, n=2048 causal, single thread, median of 3 runs.
+
+| Implementation | Forward | Backward |
+|---|---:|---:|
+| Mojo scalar | 181 ms · 3.0 GF/s | 762 ms · 2.5 GF/s |
+| Mojo SIMD (4×f64 FMA) | 66 ms · 8.1 GF/s | 190 ms · 9.9 GF/s |
+| F# scalar | 302 ms · 1.8 GF/s | 1135 ms · 1.7 GF/s |
+| F# AVX2+FMA | 101 ms · 5.3 GF/s | 310 ms · 6.1 GF/s |
+
+Training, 96 words × 3001 epochs, best of 3 (Mojo shares `bench/shared` with Rust; F# initialises from `Random(42)`):
+
+| Runtime | Pooling | Time | Final loss |
+|---|---|---:|---|
+| Mojo | mean | 1.14 s | 9.1009e-5 |
+| Mojo | attention (SIMD) | 2.76 s | 8.3181e-5 |
+| F# | mean | 2.41 s | 6.7e-5 |
+| F# | attention (AVX2+FMA) | 5.01 s | 6.5e-5 |
