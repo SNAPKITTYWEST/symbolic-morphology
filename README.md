@@ -239,12 +239,20 @@ symbolic-morphology/
 │   │
 │   ├── fsharp/                        # F# implementation (.NET 8)
 │   │   ├── Sovereign.Engine.FSharp.fsproj
+│   │   ├── Attention.fs               # Attention kernel
+│   │   ├── AttentionTests.fs          # Attention tests and benchmark
 │   │   └── Program.fs                 # Complete engine + benchmarks
 │   │
 │   └── python/                        # Python implementations
 │       ├── symbolic_bench.py          # Float-based Elman RNN
 │       ├── nand_latin.py              # NAND-gate recursive variant
 │       └── attention.py               # Attention kernel
+│
+├── mojo/
+│   ├── morphology.mojo                # Mojo engine (pool=mean | attn)
+│   ├── attention.mojo                 # Attention kernel
+│   ├── attention_test.mojo            # Attention tests
+│   └── attention_bench.mojo           # Attention benchmark
 │
 ├── docs/
 │   ├── ARCHITECTURE.md                # Deep-dive architecture document
@@ -379,7 +387,7 @@ Mojo beats the original Rust engine because that engine allocates in every forwa
 
 ## Attention Kernel
 
-Scaled dot-product attention, forward and backward. Rust: `src/rust/src/attention.rs`. Python: `src/python/attention.py`. Full documentation: [`docs/ATTENTION.md`](./docs/ATTENTION.md).
+Scaled dot-product attention, forward and backward. Rust: `src/rust/src/attention.rs`. Mojo: `mojo/attention.mojo`. F#: `src/fsharp/Attention.fs`. Python: `src/python/attention.py`. Full documentation: [`docs/ATTENTION.md`](./docs/ATTENTION.md).
 
 ### Operation
 
@@ -417,6 +425,25 @@ lean [dir] [pool=attn|mean] [epochs=3001] [isa=auto|scalar|avx2] [threads=1]
 
 Backward for `attn`: `dOᵢ = dh/n`; gradient to letter position `i` = `dQᵢ + dKᵢ + dVᵢ` (Q = K = V = X).
 
+### Ports
+
+| Language | Kernel | Tests | Paths |
+|---|---|---|---|
+| Rust | `src/rust/src/attention.rs` | `cargo test` | reference, scalar, AVX2+FMA, threaded |
+| Mojo | `mojo/attention.mojo` | `mojo/attention_test.mojo` | reference, scalar, SIMD (4×f64 FMA) |
+| F# | `src/fsharp/Attention.fs` | `selftest` | reference, scalar, AVX2+FMA (`Vector256`) |
+| Python | `src/python/attention.py` | `python3 attention.py` | reference, scalar |
+
+All four implement the same operation, the same `xorshift64` input generator and the same 16-key online-softmax forward and two-pass backward, and are checked against `bench/shared/attention_golden.txt`.
+
+### Engine arguments
+
+| Runtime | Invocation | Default pooling |
+|---|---|---|
+| Rust | `lean [dir] [pool=attn\|mean] [epochs=3001] [isa=auto\|scalar\|avx2] [threads=1]` | `attn` |
+| Mojo | `morphology [pool=mean\|attn] [epochs=3001] [kernel=simd\|scalar]` | `mean` |
+| F# | `dotnet run -c Release --project src/fsharp -- [mean\|attn] [simd\|scalar]` | `mean` |
+
 ### Build, test, benchmark
 
 ```bash
@@ -428,13 +455,28 @@ cargo run --release --bin lean -- ../../bench/shared attn
 python3 ../python/attention.py            # Python self-tests + golden vectors
 ```
 
+```bash
+cd mojo
+mojo build attention_test.mojo -o /tmp/attention_test && /tmp/attention_test
+mojo build -O3 attention_bench.mojo -o /tmp/attention_bench && /tmp/attention_bench
+mojo build -O3 morphology.mojo -o /tmp/morph_mojo && /tmp/morph_mojo attn
+```
+
+```bash
+dotnet run -c Release --project src/fsharp -- selftest           # kernel + engine checks
+dotnet run -c Release --project src/fsharp -- bench-attention
+dotnet run -c Release --project src/fsharp -- attn
+```
+
 | Test | Suite |
 |---|---|
 | Fused vs reference, forward and backward (D ∈ {4, 8, 16, 64}, both masks, scalar and AVX2, 1–4 threads) | `attention.rs` |
 | Central finite differences of dQ, dK, dV | `attention.rs` |
 | `n = 0`, `n = 1`, constant V, causal masking, large logits | `attention.rs` |
 | Bit-identical output for 1–256 threads | `attention.rs` |
-| Golden vectors | `attention.rs`, `attention.py` |
+| Golden vectors | `attention.rs`, `attention.py`, `attention_test.mojo`, `selftest` (F#) |
+| Fused vs reference, finite differences, edge cases, error paths | `attention_test.mojo`, `selftest` (F#) |
+| Engine embedding gradients vs finite differences (mean and attention pooling) | `selftest` (F#) |
 | Finite-difference check of embedding, `w1`, `b2` gradients | `lean.rs` |
 | `pool=mean` bit-identical to the original loop | `lean.rs` |
 | Scalar vs AVX2 training agreement | `lean.rs` |
@@ -452,6 +494,15 @@ Median of 3 runs, 4-vCPU host. Single head, `D = 64`, `n = 2048`, causal.
 | AVX2+FMA, 1 thread | 9.3 | 12.3 |
 | AVX2+FMA, 4 threads | 25.8 | 30.9 |
 
+Mojo and F#, `D = 64`, `n = 2048`, causal, median of 3 runs.
+
+| Implementation | Forward GF/s | Backward GF/s |
+|---|---:|---:|
+| Mojo scalar | 3.0 | 2.5 |
+| Mojo SIMD (4×f64 FMA) | 8.1 | 9.9 |
+| F# scalar | 1.8 | 1.7 |
+| F# AVX2+FMA | 5.3 | 6.1 |
+
 `lean`, 96 words × 3001 epochs, best of 3.
 
 | Pooling | Kernel | Time | Examples/s | Final loss |
@@ -459,6 +510,19 @@ Median of 3 runs, 4-vCPU host. Single head, `D = 64`, `n = 2048`, causal.
 | mean | — | 0.76 s | 381,000 | 9.1009e-5 |
 | attention | scalar | 2.15 s | 134,000 | 8.3181e-5 |
 | attention | AVX2+FMA | 1.40 s | 205,000 | 8.3181e-5 |
+
+Mojo and F# training, 96 words × 3001 epochs, best of 3.
+
+| Runtime | Pooling | Kernel | Time | Examples/s | Final loss |
+|---|---|---|---:|---:|---|
+| Mojo | mean | — | 1.14 s | 252,700 | 9.1009e-5 |
+| Mojo | attention | SIMD | 2.76 s | 104,300 | 8.3181e-5 |
+| Mojo | attention | scalar | 3.65 s | 78,900 | 8.3181e-5 |
+| F# | mean | — | 2.41 s | 119,800 | 6.7e-5 |
+| F# | attention | AVX2+FMA | 5.01 s | 57,500 | 6.5e-5 |
+| F# | attention | scalar | 6.69 s | 43,100 | 6.5e-5 |
+
+Mojo reads `bench/shared/init.txt` and `corpus.txt`, so its losses are directly comparable with Rust. F# initialises from `Random(42)`.
 
 ---
 

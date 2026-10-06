@@ -145,6 +145,14 @@ module Engine =
     let mutable a1: float[] = [||]
     let mutable yPred: float[] = [||]
 
+    // Pooling: false = original mean-pool. true = self-attention over the word's letter embeddings (Q = K = V = X,
+    // bidirectional, no new parameters): O = softmax(X X^T / sqrt(D)) X, h = (1/n) sum_i O_i, using Attention.fs.
+    let mutable poolAttention = false
+    let mutable attentionIsa = Attention.detect ()
+    let mutable xAttn: float[] = [||]
+    let mutable oAttn: float[] = [||]
+    let mutable lseAttn: float[] = [||]
+
     let init eD hD oD lr seed =
         let rng = Random(seed)
         let norm() =
@@ -166,11 +174,26 @@ module Engine =
         let H = m.hiddenDim
         let K = m.outputDim
         charIndices <- chars
-        let embV = Array.init len (fun t -> Array.init D (fun d -> m.embeddings.[chars.[t],d]))
-        pooled <- Array.init D (fun d ->
-            let mutable s = 0.0
-            for t = 0 to len - 1 do s <- s + embV.[t].[d]
-            s / float len)
+        if poolAttention then
+            let x = Array.zeroCreate<float> (len * D)
+            for t = 0 to len - 1 do
+                for d = 0 to D - 1 do x.[t * D + d] <- m.embeddings.[chars.[t], d]
+            let o = Array.zeroCreate<float> (len * D)
+            let lse = Array.zeroCreate<float> len
+            Attention.forward attentionIsa D x x x o lse len false
+            xAttn <- x
+            oAttn <- o
+            lseAttn <- lse
+            pooled <- Array.init D (fun d ->
+                let mutable s = 0.0
+                for t = 0 to len - 1 do s <- s + o.[t * D + d]
+                s / float len)
+        else
+            let embV = Array.init len (fun t -> Array.init D (fun d -> m.embeddings.[chars.[t],d]))
+            pooled <- Array.init D (fun d ->
+                let mutable s = 0.0
+                for t = 0 to len - 1 do s <- s + embV.[t].[d]
+                s / float len)
         let z1 = Array.init H (fun i ->
             let mutable s = m.b1.[i]
             for j = 0 to D - 1 do s <- s + m.w1.[i,j] * pooled.[j]
@@ -209,10 +232,22 @@ module Engine =
             let mutable s = 0.0
             for i = 0 to H - 1 do s <- s + m.w1.[i,j] * dl_dz1.[i]
             s)
-        for t = 0 to len - 1 do
-            let c = charIndices.[t]
-            for d = 0 to D - 1 do
-                m.embeddings.[c,d] <- m.embeddings.[c,d] - m.lr * invN * dl_dh.[d]
+        if poolAttention then
+            // h = (1/n) sum_i O_i  =>  dO_i = dh / n for every row; with Q = K = V = X the gradient at position i is dQ_i + dK_i + dV_i
+            let dOut = Array.init (len * D) (fun idx -> invN * dl_dh.[idx % D])
+            let dq = Array.zeroCreate<float> (len * D)
+            let dk = Array.zeroCreate<float> (len * D)
+            let dv = Array.zeroCreate<float> (len * D)
+            Attention.backward attentionIsa D xAttn xAttn xAttn oAttn lseAttn dOut dq dk dv (Array.zeroCreate len) len false
+            for t = 0 to len - 1 do
+                let c = charIndices.[t]
+                for d = 0 to D - 1 do
+                    m.embeddings.[c,d] <- m.embeddings.[c,d] - m.lr * (dq.[t * D + d] + dk.[t * D + d] + dv.[t * D + d])
+        else
+            for t = 0 to len - 1 do
+                let c = charIndices.[t]
+                for d = 0 to D - 1 do
+                    m.embeddings.[c,d] <- m.embeddings.[c,d] - m.lr * invN * dl_dh.[d]
         for i = 0 to H - 1 do
             m.b1.[i] <- m.b1.[i] - m.lr * dl_dz1.[i]
             for j = 0 to D - 1 do
@@ -222,11 +257,104 @@ module Engine =
             for j = 0 to H - 1 do
                 m.w2.[i,j] <- m.w2.[i,j] - m.lr * dl_dz2.[i] * a1.[j]
 
+/// Checks on the real engine: gradients reaching the embeddings through each pooling, training behaviour, determinism.
+module EngineChecks =
+    let private fresh () = Engine.init 16 32 Features.count 0.5 42
+
+    /// Central finite differences of the loss w.r.t. every embedding entry of the word's letters, against the gradient
+    /// that Engine.backward applied ((before - after) / lr on a fresh model). Rows of letters absent from the word must not move.
+    let gradCheck (attn: bool) (word: string) =
+        Engine.poolAttention <- attn
+        let target = Dataset.corpus() |> Array.find (fun (w, _) -> w = word) |> snd
+        let m0 = fresh ()
+        let before = Array2D.copy m0.embeddings
+        Engine.forward m0 word |> ignore
+        Engine.backward m0 target
+        let letters = word.ToUpperInvariant() |> Seq.map int |> Seq.distinct |> Seq.toArray
+        let h = 1e-4
+        let mutable nonzero = false
+        for c in letters do
+            for d = 0 to 15 do
+                let analytic = (before.[c, d] - m0.embeddings.[c, d]) / m0.lr
+                let lossAt delta =
+                    let m = fresh ()
+                    m.embeddings.[c, d] <- m.embeddings.[c, d] + delta
+                    Engine.forward m word |> ignore
+                    Engine.computeLoss target
+                let fd = (lossAt h - lossAt (-h)) / (2.0 * h)
+                if abs (fd - analytic) > 1e-8 + 1e-6 * abs analytic then
+                    failwithf "FAIL gradient (attn=%b) %s emb[%d,%d]: fd=%g analytic=%g" attn word c d fd analytic
+                if abs analytic > 1e-9 then nonzero <- true
+        if not nonzero then failwithf "FAIL (attn=%b) %s: embedding gradient is identically zero" attn word
+        for c = 0 to 127 do
+            if not (Array.contains c letters) then
+                for d = 0 to 15 do
+                    if before.[c, d] <> m0.embeddings.[c, d] then failwithf "FAIL (attn=%b) %s: row %d moved but is not in the word" attn word c
+
+    let private epoch (m: Engine.Model) (corpus: (string * float[])[]) =
+        let mutable total = 0.0
+        for (w, t) in corpus do
+            Engine.forward m w |> ignore
+            total <- total + Engine.computeLoss t
+            Engine.backward m t
+        total / float corpus.Length
+
+    let private train attn isa epochs =
+        Engine.poolAttention <- attn
+        Engine.attentionIsa <- isa
+        let m = fresh ()
+        let corpus = Dataset.corpus ()
+        let mutable last = 0.0
+        for _ in 1 .. epochs do last <- epoch m corpus
+        last, Array2D.copy m.embeddings
+
+    let runAll () =
+        for attn in [ false; true ] do
+            for word in [ "AMO"; "AMABAMUS"; "REGEBATIS" ] do gradCheck attn word
+        printfn "engine gradients (mean and attention pooling) match finite differences; only the word's letters move"
+        let first, _ = train true (Attention.detect ()) 1
+        let last, _ = train true (Attention.detect ()) 60
+        if not (last < first * 0.5) then failwithf "FAIL attention training did not reduce loss: %g -> %g" first last
+        let a, ea = train true (Attention.detect ()) 3
+        let b, eb = train true (Attention.detect ()) 3
+        if a <> b || ea <> eb then failwith "FAIL attention training is not deterministic"
+        if Attention.avx2FmaAvailable then
+            let ls, _ = train true Attention.Scalar 3
+            let lv, _ = train true Attention.Avx2Fma 3
+            if abs (ls - lv) > 1e-10 then failwithf "FAIL scalar vs AVX2 training: %g vs %g" ls lv
+        Engine.poolAttention <- false
+        printfn "attention training: loss falls %.4f -> %.4f in 60 epochs, deterministic, scalar == AVX2+FMA" first last
+
 [<EntryPoint>]
-let main _ =
+let main argv =
+  // dotnet run -c Release --project src/fsharp -- [mean|attn] [simd|scalar]   benchmark suite (default: mean pooling)
+  //                                              selftest                     attention kernel + engine checks
+  //                                              bench-attention              attention kernel timings
+  match List.ofArray argv with
+  | "selftest" :: _ ->
+    try
+        AttentionTests.runAll ()
+        EngineChecks.runAll ()
+        0
+    with e ->
+        eprintfn "%s" e.Message
+        1
+  | "bench-attention" :: _ ->
+    AttentionTests.bench ()
+    0
+  | args ->
+    match args with
+    | [] | "mean" :: _ -> ()
+    | "attn" :: _ -> Engine.poolAttention <- true
+    | x :: _ -> failwithf "unknown pool '%s' (expected mean or attn)" x
+    match args with
+    | _ :: "scalar" :: _ -> Engine.attentionIsa <- Attention.Scalar
+    | _ :: "simd" :: _ | [ _ ] | [] -> ()
+    | _ :: x :: _ -> failwithf "unknown kernel '%s' (expected simd or scalar)" x
     printfn "================================================================="
     printfn "  F# BENCHMARK SUITE"
     printfn "================================================================="
+    if Engine.poolAttention then printfn "  Pooling: attention (kernel: %s)" (Attention.isaName Engine.attentionIsa)
     let corpus = Dataset.corpus()
     let unseen = Dataset.unseen()
     let m = Engine.init 16 32 Features.count 0.5 42
